@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/rpc"
+	".."
 	"sync"
 )
 

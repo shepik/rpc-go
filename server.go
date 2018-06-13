@@ -232,6 +232,93 @@ func (server *Server) Register(rcvr interface{}) error {
 	return server.register(rcvr, "", false)
 }
 
+func (server *Server) RegisterCatcher(rcvr interface{}) error {
+	sname := "__catcher"
+	s := new(service)
+	s.typ = reflect.TypeOf(rcvr)
+	s.rcvr = reflect.ValueOf(rcvr)
+	s.name = sname
+
+	s.method = suitableMethodsCatcher(s.typ, true)
+
+	if len(s.method) == 0 {
+		str := "rpc.Register: type " + sname + " has no exported method Catch of suitable type"
+		log.Print(str)
+		return errors.New(str)
+	}
+
+	if _, dup := server.serviceMap.LoadOrStore(sname, s); dup {
+		return errors.New("rpc: service already defined: " + sname)
+	}
+
+	return nil
+}
+
+func suitableMethodsCatcher(typ reflect.Type, reportErr bool) map[string]*methodType {
+	methods := make(map[string]*methodType)
+	for m := 0; m < typ.NumMethod(); m++ {
+		method := typ.Method(m)
+		mtype := method.Type
+		mname := method.Name
+
+		// Method name must be catch
+		if mname != "Catch" {
+			continue
+		}
+		// Method must be exported.
+		if method.PkgPath != "" {
+			continue
+		}
+		// Method needs three ins: receiver, *args, *reply, ServiceName, MethodName.
+		if mtype.NumIn() != 5 {
+			if reportErr {
+				log.Printf("rpc.Register: method %q has %d input parameters; needs exactly five\n", mname, mtype.NumIn())
+			}
+			continue
+		}
+		// First arg need not be a pointer.
+		argType := mtype.In(1)
+		if !isExportedOrBuiltinType(argType) {
+			if reportErr {
+				log.Printf("rpc.Register: argument type of method %q is not exported: %q\n", mname, argType)
+			}
+			continue
+		}
+		// Second arg must be a pointer.
+		replyType := mtype.In(2)
+		if replyType.Kind() != reflect.Ptr {
+			if reportErr {
+				log.Printf("rpc.Register: reply type of method %q is not a pointer: %q\n", mname, replyType)
+			}
+			continue
+		}
+		// Reply type must be exported.
+		if !isExportedOrBuiltinType(replyType) {
+			if reportErr {
+				log.Printf("rpc.Register: reply type of method %q is not exported: %q\n", mname, replyType)
+			}
+			continue
+		}
+		// Method needs one out.
+		if mtype.NumOut() != 1 {
+			if reportErr {
+				log.Printf("rpc.Register: method %q has %d output parameters; needs exactly one\n", mname, mtype.NumOut())
+			}
+			continue
+		}
+		// The return type of the method must be error.
+		if returnType := mtype.Out(0); returnType != typeOfError {
+			if reportErr {
+				log.Printf("rpc.Register: return type of method %q is %q, must be error\n", mname, returnType)
+			}
+			continue
+		}
+		methods[mname] = &methodType{method: method, ArgType: argType, ReplyType: replyType}
+	}
+
+	return methods
+}
+
 // RegisterName is like Register but uses the provided name for the type
 // instead of the receiver's concrete type.
 func (server *Server) RegisterName(name string, rcvr interface{}) error {
@@ -381,7 +468,22 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 	mtype.Unlock()
 	function := mtype.method.Func
 	// Invoke the method, providing a new value for the reply.
-	returnValues := function.Call([]reflect.Value{s.rcvr, argv, replyv})
+	var returnValues []reflect.Value
+	if mtype.method.Type.NumIn()==5 {
+		dot := strings.LastIndex(req.ServiceMethod, ".")
+
+		if dot < 0 {
+			err := errors.New("rpc: service/method request ill-formed: " + req.ServiceMethod)
+			// Should not happen, because we checked for it in readRequestHeader
+			panic(err)
+		}
+		serviceName := reflect.ValueOf(req.ServiceMethod[:dot])
+		methodName := reflect.ValueOf(req.ServiceMethod[dot+1:])
+		//argv = append(argv, [serviceName, methodName])
+		returnValues = function.Call([]reflect.Value{s.rcvr, argv, replyv, serviceName, methodName})
+	} else {
+		returnValues = function.Call([]reflect.Value{s.rcvr, argv, replyv})
+	}
 	// The return value for the method is an error.
 	errInter := returnValues[0].Interface()
 	errmsg := ""
@@ -611,8 +713,15 @@ func (server *Server) readRequestHeader(codec ServerCodec) (svc *service, mtype 
 	// Look up the request.
 	svci, ok := server.serviceMap.Load(serviceName)
 	if !ok {
-		err = errors.New("rpc: can't find service " + req.ServiceMethod)
-		return
+		svci, ok = server.serviceMap.Load("__catcher")
+		if ok {
+			svc = svci.(*service)
+			mtype = svc.method["Catch"]
+			return
+		} else {
+			err = errors.New("rpc: can't find service " + req.ServiceMethod)
+			return
+		}
 	}
 	svc = svci.(*service)
 	mtype = svc.method[methodName]

@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net/rpc"
+	".."
 	"sync"
 )
 
